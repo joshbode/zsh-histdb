@@ -16,8 +16,8 @@ fi
 
 typeset -g HISTDB_FD
 typeset -g HISTDB_INODE=()
-typeset -g HISTDB_SESSION=""
-typeset -g HISTDB_HOST=""
+typeset -g HISTDB_SESSION="${HISTDB_SESSION:-}"
+typeset -g HISTDB_HOST="${HISTDB_HOST:-}"
 typeset -g HISTDB_INSTALLED_IN="${(%):-%N}"
 
 
@@ -50,13 +50,19 @@ _histdb_stop_sqlite_pipe () {
 add-zsh-hook zshexit _histdb_stop_sqlite_pipe
 
 _histdb_start_sqlite_pipe () {
-    local PIPE==(<<<'')
+    local PIPE
+    PIPE=$(mktemp -u "${TMPPREFIX:-/tmp/zsh}-histdb-XXXXXXXX") || return
     setopt local_options no_notify no_monitor
-    mkfifo $PIPE
-    sqlite3 -batch -noheader "${HISTDB_FILE}" < $PIPE >/dev/null &|
-    sysopen -w -o cloexec -u HISTDB_FD -- $PIPE
-    command rm $PIPE
-    zstat -A HISTDB_INODE +inode ${HISTDB_FILE}
+    {
+        mkfifo -m 600 -- $PIPE                         || return
+        # sqlite3 holds the read end; parent holds write-only via HISTDB_FD.
+        # When the parent closes HISTDB_FD (or exits), sqlite3 sees EOF and quits.
+        sqlite3 -batch -noheader "${HISTDB_FILE}" < $PIPE >/dev/null &|
+        sysopen -w -o cloexec -u HISTDB_FD -- $PIPE    || return
+        zstat -A HISTDB_INODE +inode ${HISTDB_FILE}
+    } always {
+        [[ -e $PIPE ]] && command rm -f -- $PIPE
+    }
 }
 
 _histdb_query_batch () {
@@ -71,9 +77,10 @@ _histdb_query_batch () {
 }
 
 _histdb_init () {
-    if [[ -n "${HISTDB_SESSION}" ]]; then
-        return
-    fi
+    # Gate on the pipe being live, not on HISTDB_SESSION. This lets callers
+    # pre-set HISTDB_SESSION (and HISTDB_HOST) to skip the racy startup probe
+    # while still ensuring the parent shell owns HISTDB_FD/HISTDB_INODE.
+    [[ -n "$HISTDB_FD" ]] && return
 
     if ! [[ -e "${HISTDB_FILE}" ]]; then
         local hist_dir="${HISTDB_FILE:h}"
@@ -93,13 +100,14 @@ create table history  (id integer primary key autoincrement,
 PRAGMA user_version = 2;
 EOF
     fi
+
+    HISTDB_HOST=${HISTDB_HOST:-"'$(sql_escape ${HOST})'"}
     if [[ -z "${HISTDB_SESSION}" ]]; then
         ${HISTDB_INSTALLED_IN:h}/histdb-migrate "${HISTDB_FILE}"
-        HISTDB_HOST=${HISTDB_HOST:-"'$(sql_escape ${HOST})'"}
         HISTDB_SESSION=$(_histdb_query "select 1+max(session) from history inner join places on places.id=history.place_id where places.host = ${HISTDB_HOST}")
         HISTDB_SESSION="${HISTDB_SESSION:-0}"
-        readonly HISTDB_SESSION
     fi
+    readonly HISTDB_SESSION
 
     _histdb_start_sqlite_pipe
     _histdb_query_batch >/dev/null <<EOF
@@ -216,7 +224,7 @@ histdb-sync () {
     # this ought to apply to other readers?
     echo "truncating WAL"
     echo 'pragma wal_checkpoint(truncate);' | _histdb_query_batch
-    
+
     local hist_dir="${HISTDB_FILE:h}"
     if [[ -d "$hist_dir" ]]; then
         () {
